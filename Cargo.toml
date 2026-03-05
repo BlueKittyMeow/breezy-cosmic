@@ -1,0 +1,53 @@
+[package]
+name = "breezy-cosmic"
+version = "0.1.0"
+edition = "2021"
+description = "Head-tracked virtual display for XR glasses on COSMIC desktop"
+license = "GPL-3.0-only"
+repository = "https://github.com/LaraLaFoschia/breezy-cosmic"
+
+[dependencies]
+# Wayland client
+smithay-client-toolkit = "0.20"
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["staging", "client"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+wayland-backend = "0.3"
+
+# Rendering
+wgpu = "23"
+raw-window-handle = "0.6"
+
+# Math (quaternions, matrices, transforms)
+glam = "0.29"
+
+# Shared memory / mmap
+memmap2 = "0.9"
+
+# Event loop
+calloop = "0.14"
+calloop-wayland-source = "0.4"
+
+# Config
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Byte manipulation
+bytemuck = { version = "1", features = ["derive"] }
+
+# Async runtime (for wgpu init)
+pollster = "0.4"
+
+# Directories
+dirs-next = "2"
