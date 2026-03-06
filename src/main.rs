@@ -134,7 +134,7 @@ fn main() -> Result<()> {
 
     // Render test mode: capture one frame, render it, save to file
     if args.render_test {
-        return render_test(&capture, &mut gpu, &mut renderer, &mut pose_reader, &config);
+        return render_test(&mut capture, &mut gpu, &mut renderer, &mut pose_reader, &config);
     }
 
     // ── Main path: SCTK layer-shell event loop ──
@@ -144,7 +144,7 @@ fn main() -> Result<()> {
 
 /// Render test: capture one frame, process through GPU, save result as PPM
 fn render_test(
-    capture: &capture::ScreenCapture,
+    capture: &mut capture::ScreenCapture,
     gpu: &mut GpuPipeline,
     renderer: &mut Renderer,
     pose_reader: &mut PoseReader,

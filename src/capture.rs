@@ -1,13 +1,27 @@
 //! Screen capture from the primary monitor.
 //!
-//! Uses ext-image-copy-capture-v1 protocol (preferred) or falls back to
-//! wlr-screencopy-unstable-v1 to capture frames from the primary output.
+//! Uses a Python helper (`breezy_portal_capture.py`) that manages the
+//! xdg-desktop-portal ScreenCast session and writes raw video frames to
+//! shared memory via GStreamer + PipeWire.
 //!
-//! Captured frames are uploaded to GPU textures for rendering by the
-//! head-tracked renderer.
+//! SHM layout at /dev/shm/breezy_capture:
+//!   [0..4]   magic      u32 LE  0x42434150 ("BCAP")
+//!   [4..8]   width      u32 LE
+//!   [8..12]  height     u32 LE
+//!   [12..16] stride     u32 LE  (bytes per row)
+//!   [16..20] format     u32 LE  (0=BGRx, 1=RGBx, 2=BGRA, 3=RGBA)
+//!   [20..24] frame_seq  u32 LE  (increments each new frame)
+//!   [24..32] timestamp  u64 LE  (monotonic ns)
+//!   [32..]   pixel data (height * stride bytes)
 
 use anyhow::{Context, Result};
-use tracing::{debug, info, warn};
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+use tracing::{debug, info, warn, error};
+
+const SHM_PATH: &str = "/dev/shm/breezy_capture";
+const HEADER_SIZE: usize = 32;
+const MAGIC: u32 = 0x42434150; // 'BCAP'
 
 /// Represents a captured frame ready for GPU upload
 pub struct CapturedFrame {
@@ -45,188 +59,305 @@ impl PixelFormat {
     }
 }
 
-/// Screen capture backend abstraction
+/// Screen capture backend
 pub struct ScreenCapture {
-    method: CaptureMethod,
     target_output: String,
     width: u32,
     height: u32,
+    helper_process: Option<Child>,
+    shm: Option<ShmReader>,
+    last_seq: u32,
 }
 
-#[derive(Debug)]
-enum CaptureMethod {
-    /// ext-image-copy-capture-v1 (preferred, Smithay-native)
-    ImageCopyCapture,
-    /// wlr-screencopy-unstable-v1 (fallback)
-    WlrScreencopy,
-    /// Fallback: use grim CLI tool
-    GrimFallback,
+/// Reader for the shared memory capture buffer
+struct ShmReader {
+    mmap: memmap2::Mmap,
+    _file: std::fs::File,
+}
+
+impl ShmReader {
+    fn open() -> Result<Self> {
+        let file = std::fs::File::open(SHM_PATH)
+            .context("Failed to open capture SHM")?;
+        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        Ok(Self { mmap, _file: file })
+    }
+
+    /// Re-map the file (in case it was resized)
+    fn remap(&mut self) -> Result<()> {
+        let file = std::fs::File::open(SHM_PATH)
+            .context("Failed to re-open capture SHM")?;
+        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        self._file = file;
+        self.mmap = mmap;
+        Ok(())
+    }
+
+    fn magic(&self) -> u32 {
+        if self.mmap.len() < HEADER_SIZE {
+            return 0;
+        }
+        u32::from_le_bytes(self.mmap[0..4].try_into().unwrap())
+    }
+
+    fn width(&self) -> u32 {
+        u32::from_le_bytes(self.mmap[4..8].try_into().unwrap())
+    }
+
+    fn height(&self) -> u32 {
+        u32::from_le_bytes(self.mmap[8..12].try_into().unwrap())
+    }
+
+    fn stride(&self) -> u32 {
+        u32::from_le_bytes(self.mmap[12..16].try_into().unwrap())
+    }
+
+    fn format_code(&self) -> u32 {
+        u32::from_le_bytes(self.mmap[16..20].try_into().unwrap())
+    }
+
+    fn frame_seq(&self) -> u32 {
+        u32::from_le_bytes(self.mmap[20..24].try_into().unwrap())
+    }
+
+    fn timestamp_ns(&self) -> u64 {
+        u64::from_le_bytes(self.mmap[24..32].try_into().unwrap())
+    }
+
+    fn pixel_data(&self) -> &[u8] {
+        let h = self.height() as usize;
+        let s = self.stride() as usize;
+        let end = HEADER_SIZE + h * s;
+        if end <= self.mmap.len() {
+            &self.mmap[HEADER_SIZE..end]
+        } else {
+            &[]
+        }
+    }
 }
 
 impl ScreenCapture {
     /// Create a new screen capture targeting the named output
     pub fn new(output_name: &str, width: u32, height: u32) -> Self {
         Self {
-            method: CaptureMethod::GrimFallback, // Start with simplest fallback
             target_output: output_name.to_string(),
             width,
             height,
+            helper_process: None,
+            shm: None,
+            last_seq: 0,
         }
     }
 
-    /// Initialize the capture session
+    /// Initialize the capture session.
     ///
-    /// Tries protocols in order of preference:
-    /// 1. ext-image-copy-capture-v1
-    /// 2. wlr-screencopy-v1
-    /// 3. grim CLI fallback
+    /// Launches the Python portal capture helper which handles:
+    /// 1. xdg-desktop-portal ScreenCast session
+    /// 2. PipeWire stream via GStreamer
+    /// 3. Writing raw frames to /dev/shm/breezy_capture
     pub fn init(&mut self) -> Result<()> {
-        // TODO: Implement Wayland protocol-based capture.
-        //
-        // For the initial prototype, we use grim as a capture backend.
-        // This is simpler to implement and lets us validate the rendering
-        // pipeline before investing in protocol-level capture.
-        //
-        // The protocol path will be:
-        // 1. Bind ext_image_copy_capture_manager_v1 global
-        // 2. Create capture session for target output
-        // 3. Receive buffer constraints (formats, sizes)
-        // 4. Allocate SHM or dmabuf buffers
-        // 5. Per-frame: attach buffer → capture → read pixels
+        // Find the helper script
+        let helper_path = Self::find_helper()?;
+        info!("Launching capture helper: {}", helper_path.display());
 
-        if Self::check_grim_available() {
-            self.method = CaptureMethod::GrimFallback;
-            info!("Using grim for screen capture (protocol capture coming in next iteration)");
-            Ok(())
+        // Clean up any stale SHM file
+        let _ = std::fs::remove_file(SHM_PATH);
+
+        // Launch the helper
+        let child = Command::new("/usr/bin/python3")
+            .arg(&helper_path)
+            .arg(&self.target_output)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("Failed to launch capture helper")?;
+
+        let pid = child.id();
+        self.helper_process = Some(child);
+        info!("Capture helper launched (PID {})", pid);
+
+        // Wait for the helper to create the SHM file and start writing frames.
+        // The portal may show a dialog on first use, so we allow up to 30 seconds.
+        info!("Waiting for capture helper to initialize (portal dialog may appear)...");
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(30);
+
+        loop {
+            if start.elapsed() > timeout {
+                // Check if helper is still alive
+                if let Some(ref mut child) = self.helper_process {
+                    match child.try_wait() {
+                        Ok(Some(status)) => {
+                            // Helper exited — read its stderr
+                            let mut stderr_output = String::new();
+                            if let Some(ref mut stderr) = child.stderr {
+                                use std::io::Read;
+                                let _ = stderr.read_to_string(&mut stderr_output);
+                            }
+                            anyhow::bail!(
+                                "Capture helper exited with {}: {}",
+                                status, stderr_output.trim()
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+                anyhow::bail!(
+                    "Capture helper did not produce frames within {}s. \
+                     Check if the portal dialog needs attention.",
+                    timeout.as_secs()
+                );
+            }
+
+            // Try to open and read SHM
+            if std::path::Path::new(SHM_PATH).exists() {
+                if let Ok(reader) = ShmReader::open() {
+                    if reader.magic() == MAGIC && reader.frame_seq() > 0 {
+                        let w = reader.width();
+                        let h = reader.height();
+                        info!(
+                            "Capture helper ready: {}x{} (seq={})",
+                            w, h, reader.frame_seq()
+                        );
+                        self.shm = Some(reader);
+                        return Ok(());
+                    }
+                }
+            }
+
+            // Check helper is still running
+            if let Some(ref mut child) = self.helper_process {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        let mut stderr_output = String::new();
+                        if let Some(ref mut stderr) = child.stderr {
+                            use std::io::Read;
+                            let _ = stderr.read_to_string(&mut stderr_output);
+                        }
+                        anyhow::bail!(
+                            "Capture helper exited early with {}: {}",
+                            status, stderr_output.trim()
+                        );
+                    }
+                    _ => {}
+                }
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    }
+
+    /// Capture a single frame from shared memory
+    pub fn capture_frame(&mut self) -> Result<CapturedFrame> {
+        let reader = self.shm.as_mut()
+            .ok_or_else(|| anyhow::anyhow!("Capture not initialized"))?;
+
+        // Re-map to see latest data
+        reader.remap().context("Failed to remap capture SHM")?;
+
+        if reader.magic() != MAGIC {
+            anyhow::bail!("Capture SHM has invalid magic");
+        }
+
+        let seq = reader.frame_seq();
+        if seq == self.last_seq {
+            // No new frame — return the same data anyway (caller expects a frame)
+            // This is fine since the renderer will just re-draw the same texture
+        }
+        self.last_seq = seq;
+
+        let width = reader.width();
+        let height = reader.height();
+        let stride = reader.stride();
+        let timestamp_ns = reader.timestamp_ns();
+        let fmt_code = reader.format_code();
+
+        let pixel_data = reader.pixel_data();
+        if pixel_data.is_empty() {
+            anyhow::bail!("Capture SHM pixel data is empty");
+        }
+
+        // Convert BGRx → RGBA for the GPU pipeline
+        let _format = match fmt_code {
+            0 => PixelFormat::Xrgb8888,  // BGRx (B in low byte = xRGB in LE)
+            1 => PixelFormat::Xbgr8888,  // RGBx
+            2 => PixelFormat::Argb8888,  // BGRA
+            3 => PixelFormat::Abgr8888,  // RGBA
+            _ => PixelFormat::Xrgb8888,  // Default assumption
+        };
+
+        // BGRx from GStreamer: bytes are [B, G, R, x] per pixel
+        // We need RGBA: [R, G, B, A]
+        let rgba = if fmt_code == 0 {
+            // BGRx → RGBA swizzle
+            let mut out = Vec::with_capacity(pixel_data.len());
+            for row in 0..height as usize {
+                let row_start = row * stride as usize;
+                let row_end = row_start + width as usize * 4;
+                if row_end > pixel_data.len() {
+                    break;
+                }
+                for pixel in pixel_data[row_start..row_end].chunks(4) {
+                    out.push(pixel[2]); // R (from B,G,R,x)
+                    out.push(pixel[1]); // G
+                    out.push(pixel[0]); // B
+                    out.push(255);      // A
+                }
+            }
+            out
         } else {
-            anyhow::bail!(
-                "No capture method available. Install grim: sudo apt install grim\n\
-                 (Protocol-based capture will be added in the next version)"
-            )
-        }
+            // Assume already RGBA-ish, just copy
+            pixel_data.to_vec()
+        };
+
+        Ok(CapturedFrame {
+            data: rgba,
+            width,
+            height,
+            stride: width * 4,
+            format: PixelFormat::Abgr8888,
+            timestamp_ns,
+        })
     }
 
-    /// Capture a single frame
-    pub fn capture_frame(&self) -> Result<CapturedFrame> {
-        match self.method {
-            CaptureMethod::GrimFallback => self.capture_via_grim(),
-            CaptureMethod::ImageCopyCapture => {
-                // TODO: Implement protocol-based capture
-                self.capture_via_grim()
+    /// Find the capture helper script
+    fn find_helper() -> Result<PathBuf> {
+        // Look next to the binary first
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()));
+
+        let candidates = [
+            exe_dir.as_ref().map(|d| d.join("breezy_portal_capture.py")),
+            exe_dir.as_ref().map(|d| d.join("../breezy_portal_capture.py")),
+            Some(PathBuf::from("breezy_portal_capture.py")),
+            Some(PathBuf::from(
+                "/home/bluekitty/Documents/Git/breezy-cosmic/breezy_portal_capture.py",
+            )),
+        ];
+
+        for candidate in candidates.iter().flatten() {
+            if candidate.exists() {
+                return Ok(candidate.clone());
             }
-            CaptureMethod::WlrScreencopy => {
-                // TODO: Implement protocol-based capture
-                self.capture_via_grim()
-            }
-        }
-    }
-
-    /// Capture using the `grim` command-line tool
-    fn capture_via_grim(&self) -> Result<CapturedFrame> {
-        use std::process::Command;
-
-        // grim can output raw pixel data to stdout with -t ppm,
-        // or we can capture to a temp file as PNG and decode it.
-        // For performance, we'll use raw PPM format to stdout.
-        let output = Command::new("grim")
-            .args([
-                "-o",
-                &self.target_output,
-                "-t",
-                "ppm",
-                "-",
-            ])
-            .output()
-            .context("Failed to run grim")?;
-
-        if !output.status.success() {
-            anyhow::bail!(
-                "grim capture failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
         }
 
-        // Parse PPM format (P6 binary)
-        parse_ppm(&output.stdout)
-    }
-
-    fn check_grim_available() -> bool {
-        std::process::Command::new("grim")
-            .arg("--help")
-            .output()
-            .is_ok()
+        anyhow::bail!(
+            "Could not find breezy_portal_capture.py. \
+             Place it next to the breezy-cosmic binary or in the project root."
+        )
     }
 }
 
-/// Parse PPM (P6 binary) image data into a CapturedFrame
-fn parse_ppm(data: &[u8]) -> Result<CapturedFrame> {
-    let data_str = std::str::from_utf8(data).unwrap_or("");
-
-    // PPM P6 header: "P6\n<width> <height>\n<maxval>\n<binary data>"
-    // Skip "P6\n"
-    if !data_str.starts_with("P6") {
-        anyhow::bail!("Not a valid PPM P6 file");
-    }
-    let mut pos = data_str.find('\n').unwrap_or(2) + 1;
-
-    // Skip comments
-    while pos < data.len() && data[pos] == b'#' {
-        pos = data_str[pos..].find('\n').map(|p| pos + p + 1).unwrap_or(data.len());
-    }
-
-    // Read width and height
-    let header_rest = &data_str[pos..];
-    let parts: Vec<&str> = header_rest.split_whitespace().take(3).collect();
-    if parts.len() < 3 {
-        anyhow::bail!("Invalid PPM header");
-    }
-
-    let width: u32 = parts[0].parse().context("Invalid PPM width")?;
-    let height: u32 = parts[1].parse().context("Invalid PPM height")?;
-    let _maxval: u32 = parts[2].parse().context("Invalid PPM maxval")?;
-
-    // Find start of binary data (after the third whitespace-delimited value + one byte)
-    let mut ws_count = 0;
-    let mut binary_start = pos;
-    while binary_start < data.len() && ws_count < 3 {
-        if data[binary_start].is_ascii_whitespace() {
-            ws_count += 1;
-            // Skip consecutive whitespace
-            while binary_start + 1 < data.len() && data[binary_start + 1].is_ascii_whitespace() {
-                binary_start += 1;
-            }
+impl Drop for ScreenCapture {
+    fn drop(&mut self) {
+        // Kill the helper process on cleanup
+        if let Some(ref mut child) = self.helper_process {
+            info!("Stopping capture helper (PID {})", child.id());
+            let _ = child.kill();
+            let _ = child.wait();
         }
-        binary_start += 1;
+        // Clean up SHM
+        let _ = std::fs::remove_file(SHM_PATH);
     }
-
-    let rgb_data = &data[binary_start..];
-    let expected_size = (width * height * 3) as usize;
-
-    if rgb_data.len() < expected_size {
-        anyhow::bail!(
-            "PPM data too short: {} bytes (expected {})",
-            rgb_data.len(),
-            expected_size
-        );
-    }
-
-    // Convert RGB to RGBA
-    let mut rgba = Vec::with_capacity((width * height * 4) as usize);
-    for pixel in rgb_data[..expected_size].chunks(3) {
-        rgba.push(pixel[0]); // R
-        rgba.push(pixel[1]); // G
-        rgba.push(pixel[2]); // B
-        rgba.push(255);      // A
-    }
-
-    debug!("Captured frame: {}x{} ({} bytes)", width, height, rgba.len());
-
-    Ok(CapturedFrame {
-        data: rgba,
-        width,
-        height,
-        stride: width * 4,
-        format: PixelFormat::Abgr8888,
-        timestamp_ns: 0, // TODO: use monotonic clock
-    })
 }

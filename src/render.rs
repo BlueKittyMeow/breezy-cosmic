@@ -95,11 +95,34 @@ impl Renderer {
         let display_distance = config.distance as f32;
         let display_center = Vec3::new(0.0, 0.0, -display_distance);
 
+        // Dead zone + non-linear damping: ignore micro-movements, respond to
+        // intentional head turns. This prevents involuntary micro-movements
+        // (breathing, muscle tremor, etc.) from causing visible display wobble.
+        let angle_from_last = self
+            .last_orientation
+            .inverse()
+            .mul_quat(head_orientation)
+            .to_axis_angle()
+            .1
+            .to_degrees();
+
+        let dead_zone_deg = 0.4; // Ignore movements smaller than this
+        let filtered = if angle_from_last < dead_zone_deg {
+            // Below dead zone: don't move at all
+            self.last_orientation
+        } else {
+            // Scale responsiveness by movement size:
+            // small movements (just past dead zone) → heavy smoothing
+            // large movements (intentional turns) → snappy response
+            let t = ((angle_from_last - dead_zone_deg) / 5.0).clamp(0.05, 0.8);
+            self.last_orientation.slerp(head_orientation, t).normalize()
+        };
+
         // Compute effective orientation
         let effective_orientation = if config.smooth_follow {
-            self.compute_smooth_follow(head_orientation, config)
+            self.compute_smooth_follow(filtered, config)
         } else {
-            head_orientation
+            filtered
         };
 
         self.last_orientation = effective_orientation;
