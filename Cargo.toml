@@ -51,3 +51,6 @@ pollster = "0.4"
 
 # Directories
 dirs-next = "2"
+
+# Signal handling
+libc = "0.2"

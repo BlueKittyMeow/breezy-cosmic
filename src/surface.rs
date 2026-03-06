@@ -21,7 +21,22 @@ use smithay_client_toolkit::{
     },
     shm::{slot::SlotPool, Shm, ShmHandler},
 };
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, error, info, warn};
+
+/// Global flag set by SIGUSR1 to trigger a re-pin (re-center) of the display
+static REPIN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Install the SIGUSR1 handler for re-pinning
+pub fn install_repin_handler() {
+    unsafe {
+        libc::signal(libc::SIGUSR1, repin_signal_handler as libc::sighandler_t);
+    }
+}
+
+extern "C" fn repin_signal_handler(_sig: libc::c_int) {
+    REPIN_REQUESTED.store(true, Ordering::SeqCst);
+}
 use wayland_client::{
     globals::registry_queue_init,
     protocol::{wl_output, wl_shm, wl_surface},
@@ -60,6 +75,9 @@ pub struct App {
     renderer: Renderer,
     pose_reader: PoseReader,
     config: Config,
+
+    // Source frame dimensions (may differ from viewport for window capture)
+    source_size: Option<(u32, u32)>,
 
     // Stats
     frame_count: u64,
@@ -138,6 +156,7 @@ impl App {
             renderer,
             pose_reader,
             config,
+            source_size: None,
             frame_count: 0,
             loop_start: std::time::Instant::now(),
         };
@@ -220,6 +239,12 @@ impl App {
         let height = self.height;
         let stride = width as i32 * 4;
 
+        // 0. Check for re-pin signal (SIGUSR1)
+        if REPIN_REQUESTED.swap(false, Ordering::SeqCst) {
+            info!("Re-pin requested — resetting orientation reference");
+            self.renderer.reset_smooth_follow();
+        }
+
         // 1. Read current head pose from XRLinuxDriver shared memory
         let pose = self.pose_reader.try_read();
 
@@ -237,22 +262,28 @@ impl App {
 
         // 2. Capture frame from primary monitor, or use test pattern if unavailable
         match self.capture.capture_frame() {
-            Ok(frame) => self.gpu.upload_frame(&frame),
+            Ok(frame) => {
+                self.source_size = Some((frame.width, frame.height));
+                self.gpu.upload_frame(&frame);
+            }
             Err(e) => {
                 if self.frame_count == 0 {
                     warn!("Capture unavailable ({}), using test pattern", e);
-                    // Generate a test pattern so head tracking is visible
                     let test = generate_test_pattern(width, height);
+                    self.source_size = Some((width, height));
                     self.gpu.upload_frame(&test);
                 }
-                // On subsequent frames, reuse the existing GPU texture
             }
         }
 
         // 4. Compute view-projection matrix from head pose
         let mvp = if let Some(ref pose_data) = pose {
-            self.renderer
-                .compute_view_matrix(pose_data, &self.config.display, (width, height))
+            self.renderer.compute_view_matrix(
+                pose_data,
+                &self.config.display,
+                (width, height),
+                self.source_size,
+            )
         } else {
             // No pose data — render flat/centered (identity)
             Mat4::IDENTITY

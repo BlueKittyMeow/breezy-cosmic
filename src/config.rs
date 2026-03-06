@@ -30,6 +30,14 @@ pub struct DisplayConfig {
     /// Degrees of head rotation before smooth follow kicks in
     #[serde(default = "default_follow_threshold")]
     pub follow_threshold: f64,
+
+    /// Yaw offset in degrees to pin the display (negative = left, positive = right)
+    #[serde(default)]
+    pub pin_yaw: f64,
+
+    /// Pitch offset in degrees to pin the display (negative = down, positive = up)
+    #[serde(default)]
+    pub pin_pitch: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,6 +49,10 @@ pub struct CaptureConfig {
     /// Prefer dmabuf over SHM for zero-copy capture
     #[serde(default = "default_true")]
     pub use_dmabuf: bool,
+
+    /// Capture source: "monitor" (whole screen) or "window" (pick a window)
+    #[serde(default = "default_source")]
+    pub source: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,6 +73,7 @@ fn default_true() -> bool { true }
 fn default_follow_threshold() -> f64 { 15.0 }
 fn default_fps() -> u32 { 60 }
 fn default_xr_match() -> String { "VITURE".to_string() }
+fn default_source() -> String { "monitor".to_string() }
 
 impl Default for Config {
     fn default() -> Self {
@@ -79,6 +92,8 @@ impl Default for DisplayConfig {
             scale: default_scale(),
             smooth_follow: true,
             follow_threshold: default_follow_threshold(),
+            pin_yaw: 0.0,
+            pin_pitch: 0.0,
         }
     }
 }
@@ -88,6 +103,7 @@ impl Default for CaptureConfig {
         Self {
             target_fps: default_fps(),
             use_dmabuf: true,
+            source: default_source(),
         }
     }
 }

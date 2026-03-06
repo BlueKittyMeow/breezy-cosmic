@@ -64,6 +64,7 @@ pub struct ScreenCapture {
     target_output: String,
     width: u32,
     height: u32,
+    source_type: String,
     helper_process: Option<Child>,
     shm: Option<ShmReader>,
     last_seq: u32,
@@ -138,11 +139,12 @@ impl ShmReader {
 
 impl ScreenCapture {
     /// Create a new screen capture targeting the named output
-    pub fn new(output_name: &str, width: u32, height: u32) -> Self {
+    pub fn new(output_name: &str, width: u32, height: u32, source: &str) -> Self {
         Self {
             target_output: output_name.to_string(),
             width,
             height,
+            source_type: source.to_string(),
             helper_process: None,
             shm: None,
             last_seq: 0,
@@ -167,6 +169,7 @@ impl ScreenCapture {
         let child = Command::new("/usr/bin/python3")
             .arg(&helper_path)
             .arg(&self.target_output)
+            .arg(&self.source_type)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -180,7 +183,7 @@ impl ScreenCapture {
         // The portal may show a dialog on first use, so we allow up to 30 seconds.
         info!("Waiting for capture helper to initialize (portal dialog may appear)...");
         let start = std::time::Instant::now();
-        let timeout = std::time::Duration::from_secs(30);
+        let timeout = std::time::Duration::from_secs(120);
 
         loop {
             if start.elapsed() > timeout {

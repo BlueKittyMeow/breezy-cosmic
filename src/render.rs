@@ -76,6 +76,7 @@ impl Renderer {
         pose: &PoseData,
         config: &DisplayConfig,
         viewport_size: (u32, u32),
+        source_size: Option<(u32, u32)>,
     ) -> Mat4 {
         let raw_q = pose.orientation();
         let head_orientation = self.sensor_to_renderer(raw_q);
@@ -91,9 +92,20 @@ impl Renderer {
             raw_q.x, raw_q.y, raw_q.z, raw_q.w,
         );
 
-        // Display placement: centered at (distance) meters in front of user
+        // Display placement: offset by pin_yaw/pin_pitch, then placed at distance
         let display_distance = config.distance as f32;
-        let display_center = Vec3::new(0.0, 0.0, -display_distance);
+        let pin_yaw_rad = (config.pin_yaw as f32).to_radians();
+        let pin_pitch_rad = (config.pin_pitch as f32).to_radians();
+
+        // Pin rotation: rotate the display's world position by the pin angles
+        // so it sits at a fixed direction in the user's environment
+        let pin_rotation = Quat::from_euler(
+            glam::EulerRot::YXZ,
+            pin_yaw_rad,    // yaw: left/right
+            pin_pitch_rad,  // pitch: up/down
+            0.0,            // no roll on the pin
+        );
+        let display_center = pin_rotation * Vec3::new(0.0, 0.0, -display_distance);
 
         // Dead zone + non-linear damping: ignore micro-movements, respond to
         // intentional head turns. This prevents involuntary micro-movements
@@ -143,14 +155,22 @@ impl Renderer {
             46.0f32.to_radians()
         };
 
-        let aspect = viewport_size.0 as f32 / viewport_size.1 as f32;
-        let projection = Mat4::perspective_rh(fov_rad, aspect, 0.01, 100.0);
+        let viewport_aspect = viewport_size.0 as f32 / viewport_size.1 as f32;
+        let projection = Mat4::perspective_rh(fov_rad, viewport_aspect, 0.01, 100.0);
 
-        // Model matrix: scale quad to fill the virtual display area
+        // Use source aspect ratio for the quad shape so content isn't stretched.
+        // Falls back to viewport aspect if no source dimensions provided.
+        let source_aspect = match source_size {
+            Some((sw, sh)) if sw > 0 && sh > 0 => sw as f32 / sh as f32,
+            _ => viewport_aspect,
+        };
+
+        // Model matrix: place quad at pin offset, oriented to face origin
         let display_scale = display_distance * (fov_rad / 2.0).tan();
         let model = Mat4::from_translation(display_center)
+            * Mat4::from_quat(pin_rotation)  // orient quad to face the viewer
             * Mat4::from_scale(Vec3::new(
-                display_scale * aspect * config.scale as f32,
+                display_scale * source_aspect * config.scale as f32,
                 display_scale * config.scale as f32,
                 1.0,
             ));

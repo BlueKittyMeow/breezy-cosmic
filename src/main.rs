@@ -64,6 +64,9 @@ fn main() -> Result<()> {
         Config::load_or_default()
     };
 
+    // Install SIGUSR1 handler for re-pinning
+    surface::install_repin_handler();
+
     info!("breezy-cosmic v{}", env!("CARGO_PKG_VERSION"));
     info!("Configuration: {:?}", config);
 
@@ -116,6 +119,7 @@ fn main() -> Result<()> {
         &primary.name,
         primary.width as u32,
         primary.height as u32,
+        &config.capture.source,
     );
     capture
         .init()
@@ -161,7 +165,7 @@ fn render_test(
 
     let mvp = if let Some(pose) = pose_reader.try_read() {
         info!("Using live pose data for render test");
-        renderer.compute_view_matrix(&pose, &config.display, (gpu.width, gpu.height))
+        renderer.compute_view_matrix(&pose, &config.display, (gpu.width, gpu.height), Some((frame.width, frame.height)))
     } else {
         info!("No pose data — rendering with identity matrix");
         Mat4::IDENTITY

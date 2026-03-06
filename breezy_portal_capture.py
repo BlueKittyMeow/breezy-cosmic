@@ -141,6 +141,7 @@ class ScreenCastPortal:
         )
         self.session_handle = None
         self.pw_node_id = None
+        self.source_type = "monitor"  # "monitor" or "window"
         self._counter = 0
 
     def _token(self):
@@ -189,7 +190,12 @@ class ScreenCastPortal:
         token = self._token()
         request_path = f"/org/freedesktop/portal/desktop/request/{self._sender_name()}/{token}"
 
-        print("[capture] Selecting sources (MONITOR, cursor embedded)...", flush=True)
+        # Always request BOTH source types (MONITOR | WINDOW = 3) so the
+        # portal dialog shows all tabs.  COSMIC's xdg-desktop-portal may
+        # not display screens at all when only type 1 is requested.
+        src_types = 3  # MONITOR | WINDOW — dialog will show both tabs
+        print(f"[capture] Selecting sources (requested: {self.source_type}, "
+              f"portal types={src_types}, cursor embedded)...", flush=True)
 
         self.bus.add_signal_receiver(
             self._on_select_sources_response,
@@ -198,13 +204,14 @@ class ScreenCastPortal:
             path=request_path,
         )
 
+        # Don't use persist_mode — a cached restore token from a previous
+        # session might force the wrong source type.
         self.screencast.SelectSources(
             dbus.ObjectPath(self.session_handle),
             dbus.Dictionary({
                 'handle_token': token,
-                'types': dbus.UInt32(1),        # MONITOR
+                'types': dbus.UInt32(src_types),
                 'cursor_mode': dbus.UInt32(2),   # EMBEDDED
-                'persist_mode': dbus.UInt32(2),  # persistent until revoked
             }, signature='sv')
         )
 
@@ -334,9 +341,13 @@ def cleanup(*args):
 def main():
     global loop, target_output
 
+    source_type = "monitor"  # default
     if len(sys.argv) > 1:
         target_output = sys.argv[1]
         print(f"[capture] Target output: {target_output}", flush=True)
+    if len(sys.argv) > 2:
+        source_type = sys.argv[2].lower()
+        print(f"[capture] Source type: {source_type}", flush=True)
 
     # CRITICAL: Set up GLib as the D-Bus main loop BEFORE creating the bus
     dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
@@ -356,6 +367,7 @@ def main():
 
     # Start the portal session chain
     portal = ScreenCastPortal(bus, loop)
+    portal.source_type = source_type
     portal.start()
 
     # Run the main loop — this processes both D-Bus signals and GStreamer
