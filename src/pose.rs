@@ -112,19 +112,26 @@ impl PoseReader {
             return None;
         }
 
-        // Verify parity byte
-        let parity_expected = data[..MIN_SHM_SIZE - 1]
-            .iter()
-            .fold(0u8, |acc, &b| acc ^ b);
-        let parity_actual = data[MIN_SHM_SIZE - 1];
-
-        if parity_expected != parity_actual {
-            trace!("Parity mismatch: expected {:#x}, got {:#x}", parity_expected, parity_actual);
-            // Don't fail on parity — the data might be mid-write.
-            // We'll use it anyway and rely on timestamp checking for staleness.
+        // Verify parity: XOR of epoch_ms bytes + orientation bytes only
+        // (matches XRLinuxDriver C code parity computation)
+        let pose = parse_pose_data(data);
+        let epoch_bytes = pose.timestamp_ms.to_le_bytes();
+        let mut parity_expected: u8 = 0;
+        for &b in &epoch_bytes {
+            parity_expected ^= b;
+        }
+        for f in &pose.orientations {
+            for &b in &f.to_le_bytes() {
+                parity_expected ^= b;
+            }
         }
 
-        Some(parse_pose_data(data))
+        if parity_expected != pose.parity {
+            trace!("Parity mismatch: expected {:#x}, got {:#x}", parity_expected, pose.parity);
+            // Don't fail on parity — the data might be mid-write.
+        }
+
+        Some(pose)
     }
 
     /// Try to read pose, initializing mmap on first call if available

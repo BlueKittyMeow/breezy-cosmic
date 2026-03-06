@@ -13,7 +13,9 @@ use crate::pose::PoseData;
 
 /// Manages the rendering pipeline for head-tracked display
 pub struct Renderer {
-    /// Current smooth-follow anchor orientation
+    /// Reference quaternion captured at startup (in raw Madgwick space)
+    reference_q: Option<Quat>,
+    /// Current smooth-follow anchor orientation (in renderer space)
     smooth_follow_anchor: Quat,
     /// Whether smooth follow anchor has been initialized
     anchor_initialized: bool,
@@ -24,10 +26,43 @@ pub struct Renderer {
 impl Renderer {
     pub fn new() -> Self {
         Self {
+            reference_q: None,
             smooth_follow_anchor: Quat::IDENTITY,
             anchor_initialized: false,
             last_orientation: Quat::IDENTITY,
         }
+    }
+
+    /// Convert a raw Madgwick quaternion to a relative orientation in renderer space.
+    ///
+    /// Strategy: use RELATIVE orientation to avoid absolute NED↔OpenGL headaches.
+    /// 1. Capture first valid quaternion as "reference" (= looking straight ahead)
+    /// 2. Compute delta = ref.inverse() * current (change in sensor frame)
+    /// 3. Remap delta's rotation axis from sensor frame to renderer frame
+    fn sensor_to_renderer(&mut self, raw_q: Quat) -> Quat {
+        // Capture reference on first call
+        let ref_q = *self.reference_q.get_or_insert(raw_q);
+
+        // Delta in sensor frame: how has orientation changed since reference?
+        let delta = ref_q.inverse() * raw_q;
+
+        // Empirically determined axis mapping from user testing:
+        //
+        // Sensor physical axes (VITURE Luma Ultra IMU chip orientation):
+        //   Sensor X = forward (nose direction) — tilt axis
+        //   Sensor Y = up (top of head)         — yaw axis
+        //   Sensor Z = right (ear direction)    — pitch/nod axis
+        //
+        // Renderer (OpenGL/wgpu):
+        //   Renderer X = right  — pitch axis (vertical movement)
+        //   Renderer Y = up     — yaw axis (horizontal movement)
+        //   Renderer Z = back   — roll axis (in-place rotation)
+        //
+        // Mapping with sign corrections (from empirical testing):
+        //   renderer_x = -sensor_z  (nod down → display moves up)
+        //   renderer_y = -sensor_y  (turn right → display slides left)
+        //   renderer_z =  sensor_x  (tilt left → display rotates clockwise)
+        Quat::from_xyzw(-delta.z, -delta.y, delta.x, delta.w).normalize()
     }
 
     /// Compute the view-projection matrix for the current pose
@@ -42,8 +77,19 @@ impl Renderer {
         config: &DisplayConfig,
         viewport_size: (u32, u32),
     ) -> Mat4 {
-        let head_orientation = pose.orientation();
-        let head_position = Vec3::from(pose.position_eus());
+        let raw_q = pose.orientation();
+        let head_orientation = self.sensor_to_renderer(raw_q);
+
+        // Debug: log Euler angles in renderer space
+        let (yaw, pitch, roll) = {
+            let (y, x, z) = head_orientation.to_euler(glam::EulerRot::YXZ);
+            (y.to_degrees(), x.to_degrees(), z.to_degrees())
+        };
+        trace!(
+            "Head: yaw={:.1}° pitch={:.1}° roll={:.1}° | raw=({:.3},{:.3},{:.3},{:.3})",
+            yaw, pitch, roll,
+            raw_q.x, raw_q.y, raw_q.z, raw_q.w,
+        );
 
         // Display placement: centered at (distance) meters in front of user
         let display_distance = config.distance as f32;
@@ -58,25 +104,20 @@ impl Renderer {
 
         self.last_orientation = effective_orientation;
 
-        // Build the view matrix:
-        // 1. The virtual display is a quad at display_center in world space
-        // 2. The camera (user's head) is at origin, looking along -Z
-        // 3. Head rotation rotates the camera, making the display appear to move
-        //
-        // For head-locked rendering (display moves with head), we'd use identity.
-        // For world-locked (display stays in place), we use the inverse of head rotation.
+        // View matrix: the head_orientation is a relative rotation from "looking ahead"
+        // We want the display to appear pinned in space, so when the head turns right,
+        // the display slides left. This means the camera rotation = head rotation.
+        // (No inverse needed — the relative quaternion already represents the view change)
+        let camera_rotation = effective_orientation;
 
-        let camera_rotation = effective_orientation.inverse();
+        // View matrix: rotate world by head orientation
+        let view = Mat4::from_quat(camera_rotation);
 
-        // View matrix: rotate world by inverse of head orientation
-        let view = Mat4::from_quat(camera_rotation)
-            * Mat4::from_translation(-head_position);
-
-        // Projection: simple perspective based on display FOV
+        // Projection: perspective based on display FOV
         let fov_rad = if pose.display_fov > 0.0 {
             pose.display_fov.to_radians()
         } else {
-            46.0f32.to_radians() // Default ~46° FOV for Viture Luma Pro
+            46.0f32.to_radians()
         };
 
         let aspect = viewport_size.0 as f32 / viewport_size.1 as f32;
@@ -112,9 +153,7 @@ impl Renderer {
         let angle_deg = relative.to_axis_angle().1.to_degrees();
 
         if angle_deg > config.follow_threshold as f32 {
-            // Head has moved beyond threshold — start moving the anchor
-            // Use SLERP to smoothly interpolate the anchor toward current gaze
-            let follow_speed = 0.05; // How fast the display follows (0 = locked, 1 = instant)
+            let follow_speed = 0.05;
             let overshoot = (angle_deg - config.follow_threshold as f32) / angle_deg;
             let t = (follow_speed * overshoot).min(0.3);
 
@@ -134,9 +173,10 @@ impl Renderer {
         self.smooth_follow_anchor
     }
 
-    /// Reset smooth follow anchor to current head position
+    /// Reset smooth follow anchor AND reference orientation
     pub fn reset_smooth_follow(&mut self) {
         self.anchor_initialized = false;
+        self.reference_q = None;
     }
 
     /// Generate vertices for a textured quad (the virtual display surface)

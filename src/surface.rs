@@ -71,6 +71,12 @@ impl App {
     ///
     /// This connects to Wayland, creates the layer-shell surface,
     /// and enters the SCTK event loop. Returns when the surface is closed.
+    ///
+    /// Output targeting strategy:
+    ///   1. Create an initial layer surface (untargeted) so App can be constructed
+    ///   2. Roundtrip the event queue to populate SCTK OutputState
+    ///   3. Find the XR glasses wl_output by matching connector name
+    ///   4. Recreate the layer surface targeting the correct output
     pub fn run(
         _primary: &OutputInfo,
         xr: &OutputInfo,
@@ -97,52 +103,31 @@ impl App {
         let output_state = OutputState::new(&globals, &qh);
         let registry_state = RegistryState::new(&globals);
 
-        // Create the wl_surface for our overlay
-        let surface = compositor.create_surface(&qh);
-
-        // For now, create the layer surface without targeting a specific output.
-        // The SCTK OutputState needs a roundtrip to discover output info (names),
-        // but we can't roundtrip without an App instance. Since we know the XR
-        // glasses are a separate display, the compositor will place the overlay
-        // on the default output. We'll add output targeting in Phase 2 once we
-        // have the Wayland event model fully wired up.
-        //
-        // TODO Phase 2: Implement two-phase init with output discovery roundtrip
-        // so we can pass Some(&wl_output) here to target the XR glasses directly.
-        let layer = layer_shell.create_layer_surface(
-            &qh,
-            surface,
-            Layer::Overlay,
-            Some("breezy-cosmic"),
-            None, // Will target specific output in Phase 2
-        );
-
-        // Configure: fullscreen overlay, no keyboard, don't push other surfaces
-        layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
-        layer.set_exclusive_zone(-1);
-        layer.set_keyboard_interactivity(KeyboardInteractivity::None);
-        layer.set_size(xr.width as u32, xr.height as u32);
-
-        // Initial commit (no buffer attached) — required by protocol
-        layer.commit();
-
         let xr_width = xr.width as u32;
         let xr_height = xr.height as u32;
+
+        // Create an initial untargeted layer surface so we can construct App
+        // and roundtrip the event queue (needed to populate OutputState).
+        let initial_surface = compositor.create_surface(&qh);
+        let initial_layer = layer_shell.create_layer_surface(
+            &qh,
+            initial_surface,
+            Layer::Overlay,
+            Some("breezy-cosmic"),
+            None, // untargeted — will be replaced after output discovery
+        );
+        configure_layer(&initial_layer, xr_width, xr_height);
+        initial_layer.commit();
 
         // Allocate SHM buffer pool (triple-buffered: 3x frame size)
         let pool_size = (xr_width * xr_height * 4 * 3) as usize;
         let pool = SlotPool::new(pool_size, &shm).context("Failed to create SHM buffer pool")?;
 
-        info!(
-            "Layer surface created ({}x{}), overlay mode, awaiting configure...",
-            xr_width, xr_height
-        );
-
         let mut app = App {
             registry_state,
             output_state,
             shm,
-            layer,
+            layer: initial_layer,
             pool,
             configured: false,
             width: xr_width,
@@ -157,7 +142,60 @@ impl App {
             loop_start: std::time::Instant::now(),
         };
 
-        // Event loop — SCTK drives everything from here
+        // ── Output discovery phase ──────────────────────────────────
+        //
+        // Roundtrip the event queue to populate SCTK OutputState with
+        // all connected wl_output objects and their metadata (name, modes, etc.)
+        info!("Discovering Wayland outputs...");
+        event_queue.roundtrip(&mut app).context("Roundtrip 1 failed")?;
+        event_queue.roundtrip(&mut app).context("Roundtrip 2 failed")?;
+        event_queue.roundtrip(&mut app).context("Roundtrip 3 failed")?;
+
+        // Find the XR glasses output by connector name (e.g. "HDMI-A-1")
+        let xr_wl_output = find_output_by_name(&app.output_state, &xr.name);
+
+        if let Some(ref target) = xr_wl_output {
+            // Found the XR output — recreate layer surface targeting it
+            info!("Found XR output '{}', creating targeted overlay", xr.name);
+
+            let targeted_surface = compositor.create_surface(&qh);
+            let targeted_layer = layer_shell.create_layer_surface(
+                &qh,
+                targeted_surface,
+                Layer::Overlay,
+                Some("breezy-cosmic"),
+                Some(target),
+            );
+            configure_layer(&targeted_layer, xr_width, xr_height);
+            targeted_layer.commit();
+
+            // Replace the untargeted surface with the targeted one.
+            // Dropping the old LayerSurface sends the protocol destroy message.
+            app.layer = targeted_layer;
+            app.configured = false;
+        } else {
+            // Couldn't find XR output by name — fall back to untargeted.
+            // Log all discovered outputs to help debugging.
+            warn!(
+                "XR output '{}' not found in Wayland outputs, falling back to compositor default",
+                xr.name
+            );
+            for output in app.output_state.outputs() {
+                if let Some(info) = app.output_state.info(&output) {
+                    warn!(
+                        "  Available output: {:?} ({} {})",
+                        info.name, info.make, info.model
+                    );
+                }
+            }
+        }
+
+        info!(
+            "Layer surface created ({}x{}), overlay mode, awaiting configure...",
+            xr_width, xr_height
+        );
+
+        // ── Event loop — SCTK drives everything from here ──────────
         info!("Entering event loop (Ctrl+C to exit)");
         loop {
             event_queue
@@ -185,18 +223,31 @@ impl App {
         // 1. Read current head pose from XRLinuxDriver shared memory
         let pose = self.pose_reader.try_read();
 
-        // 2. Capture frame from primary monitor (via grim)
-        let frame = match self.capture.capture_frame() {
-            Ok(f) => f,
-            Err(e) => {
-                debug!("Capture failed: {}", e);
-                self.request_next_frame(qh);
-                return;
+        if self.frame_count % 120 == 0 {
+            if let Some(ref p) = pose {
+                let q = p.orientation();
+                info!(
+                    "Pose: q=({:.3}, {:.3}, {:.3}, {:.3}) fov={:.1}° ts={}",
+                    q.x, q.y, q.z, q.w, p.display_fov, p.timestamp_ms
+                );
+            } else {
+                warn!("Pose: NONE (try_read returned None)");
             }
-        };
+        }
 
-        // 3. Upload captured frame to GPU texture
-        self.gpu.upload_frame(&frame);
+        // 2. Capture frame from primary monitor, or use test pattern if unavailable
+        match self.capture.capture_frame() {
+            Ok(frame) => self.gpu.upload_frame(&frame),
+            Err(e) => {
+                if self.frame_count == 0 {
+                    warn!("Capture unavailable ({}), using test pattern", e);
+                    // Generate a test pattern so head tracking is visible
+                    let test = generate_test_pattern(width, height);
+                    self.gpu.upload_frame(&test);
+                }
+                // On subsequent frames, reuse the existing GPU texture
+            }
+        }
 
         // 4. Compute view-projection matrix from head pose
         let mvp = if let Some(ref pose_data) = pose {
@@ -280,6 +331,98 @@ impl App {
             .wl_surface()
             .frame(qh, self.layer.wl_surface().clone());
     }
+}
+
+// ── Helper functions ────────────────────────────────────────────────
+
+use crate::capture::{CapturedFrame, PixelFormat};
+
+/// Generate a test pattern for head-tracking verification.
+///
+/// Renders a grid of colored tiles with a central crosshair,
+/// so head movement is immediately visible as the pattern shifts.
+fn generate_test_pattern(width: u32, height: u32) -> CapturedFrame {
+    let mut data = vec![0u8; (width * height * 4) as usize];
+    let tile_size = 64u32;
+
+    for y in 0..height {
+        for x in 0..width {
+            let offset = ((y * width + x) * 4) as usize;
+            let tx = x / tile_size;
+            let ty = y / tile_size;
+
+            // Checkerboard base pattern
+            let checker = (tx + ty) % 2 == 0;
+
+            // Color based on quadrant
+            let cx = x as f32 / width as f32;
+            let cy = y as f32 / height as f32;
+
+            let (r, g, b) = if checker {
+                // Gradient tiles: position-based color
+                ((cx * 200.0) as u8 + 40, (cy * 200.0) as u8 + 40, 120)
+            } else {
+                // Dark tiles
+                (30, 30, 40)
+            };
+
+            // Draw crosshair at center (2px wide)
+            let is_crosshair = (x as i32 - width as i32 / 2).unsigned_abs() < 2
+                || (y as i32 - height as i32 / 2).unsigned_abs() < 2;
+
+            // Draw border around edges (4px)
+            let is_border = x < 4 || x >= width - 4 || y < 4 || y >= height - 4;
+
+            if is_crosshair {
+                data[offset] = 255; // R
+                data[offset + 1] = 255; // G
+                data[offset + 2] = 0;   // B
+                data[offset + 3] = 255; // A
+            } else if is_border {
+                data[offset] = 255;
+                data[offset + 1] = 0;
+                data[offset + 2] = 0;
+                data[offset + 3] = 255;
+            } else {
+                data[offset] = r;
+                data[offset + 1] = g;
+                data[offset + 2] = b;
+                data[offset + 3] = 255;
+            }
+        }
+    }
+
+    CapturedFrame {
+        data,
+        width,
+        height,
+        stride: width * 4,
+        format: PixelFormat::Abgr8888,
+        timestamp_ns: 0,
+    }
+}
+
+/// Configure a layer surface as a fullscreen XR overlay
+fn configure_layer(layer: &LayerSurface, width: u32, height: u32) {
+    layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
+    layer.set_exclusive_zone(-1);
+    layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+    layer.set_size(width, height);
+}
+
+/// Find a wl_output by connector name (e.g. "HDMI-A-1") in SCTK OutputState
+fn find_output_by_name(
+    output_state: &OutputState,
+    target_name: &str,
+) -> Option<wl_output::WlOutput> {
+    for output in output_state.outputs() {
+        if let Some(info) = output_state.info(&output) {
+            if info.name.as_deref() == Some(target_name) {
+                return Some(output);
+            }
+        }
+    }
+    None
 }
 
 // ── SCTK trait implementations ──────────────────────────────────────
